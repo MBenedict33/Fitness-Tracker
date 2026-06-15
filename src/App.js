@@ -774,7 +774,7 @@ function MealPlanScreen({ mealLog, onLogMeal, hydrationLog, onLogHydration }) {
                 </div>
                 {isLogged
                   ? <button onClick={()=>handleUnlog(meal)} style={{background:C.green+"18",border:`1px solid ${C.green}`,borderRadius:8,color:C.green,padding:"6px 10px",fontSize:10,fontFamily:F.display,cursor:"pointer",whiteSpace:"nowrap"}}>LOGGED ✓</button>
-                  : <button onClick={()=>{setLogMode(isOpen?null:{day:selectedDay,meal});setInputMode("manual");setManualEntry({name:"",cal:"",protein:"",carbs:"",fat:""});setPhotoState(prev=>({...prev,[meal]:{}})});}} style={{background:C.dim,border:`1px solid ${C.border}`,borderRadius:8,color:C.muted,padding:"6px 10px",fontSize:10,fontFamily:F.display,cursor:"pointer",whiteSpace:"nowrap"}}>{isOpen?"CANCEL":"LOG"}</button>
+                  : <button onClick={()=>{setLogMode(isOpen?null:{day:selectedDay,meal});setInputMode("manual");setManualEntry({name:"",cal:"",protein:"",carbs:"",fat:""});setPhotoState(prev=>({...prev,[meal]:{}}));}} style={{background:C.dim,border:`1px solid ${C.border}`,borderRadius:8,color:C.muted,padding:"6px 10px",fontSize:10,fontFamily:F.display,cursor:"pointer",whiteSpace:"nowrap"}}>{isOpen?"CANCEL":"LOG"}</button>
                 }
               </div>
             </div>
