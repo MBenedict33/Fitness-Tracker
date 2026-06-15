@@ -59,6 +59,13 @@ const DB = {
   async saveHydration(dateKey, oz) {
     return sb.upsert("ft_hydration", { date_key: dateKey, oz, updated_at: new Date().toISOString() });
   },
+  async loadRecovery() {
+    const rows = await sb.getAll("ft_recovery");
+    return Object.fromEntries(rows.map(r => [r.date_key, r.data]));
+  },
+  async saveRecovery(dateKey, data) {
+    return sb.upsert("ft_recovery", { date_key: dateKey, data, updated_at: new Date().toISOString() });
+  },
 };
 
 // ── Design tokens ─────────────────────────────────────────────────────────────
@@ -242,27 +249,96 @@ function FormField({ label, hint, value, onChange, type="number", placeholder, m
   );
 }
 
-function CoachInsight({ entry }) {
+function CoachInsight({ entry, checkins = [], workouts = {} }) {
   const rec  = parseFloat(entry.recovery);
   const hrv  = parseFloat(entry.hrv);
   const debt = parseFloat(entry.sleepDebt);
   const wt   = parseFloat(entry.weight);
   const bp   = parseFloat(entry.bpSys);
   const insights = [];
+
+  // ── 7-day rolling averages ──────────────────────────────────────────────────
+  const last7 = checkins.slice(0, 7);
+  const avg = (key) => {
+    const vals = last7.map(c => parseFloat(c[key])).filter(v => !isNaN(v));
+    return vals.length > 0 ? vals.reduce((a,b) => a+b, 0) / vals.length : null;
+  };
+  const avgRec = avg("recovery");
+  const avgHrv = avg("hrv");
+  const avgDebt = avg("sleepDebt");
+  const avgWt = avg("weight");
+
+  // ── Trend detection (last 3 days) ───────────────────────────────────────────
+  const trend3 = (key) => {
+    const vals = checkins.slice(0,3).map(c => parseFloat(c[key])).filter(v => !isNaN(v));
+    if (vals.length < 2) return null;
+    return vals[0] - vals[vals.length-1]; // positive = rising recently
+  };
+  const hrvTrend = trend3("hrv");
+  const recTrend = trend3("recovery");
+  const wtTrend  = trend3("weight");
+
+  // ── Training load — sessions in last 3 days ─────────────────────────────────
+  const recentDates = [0,1,2].map(i => { const d=new Date(); d.setDate(d.getDate()-i); return d.toISOString().split("T")[0]; });
+  const recentSessions = Object.values(workouts).filter(s => recentDates.includes(s.date));
+  const heavyDays = recentSessions.length;
+
+  // ── Recovery insight ────────────────────────────────────────────────────────
   if (!isNaN(rec)) {
-    if (rec >= 67) insights.push({ icon:"💚", text:"Recovery is green — good day to push intensity or hit a priority lift." });
-    else if (rec >= 34) insights.push({ icon:"🟡", text:"Yellow recovery. Aim for moderate effort. Skip max intensity work today." });
-    else insights.push({ icon:"🔴", text:"Red recovery. Prioritize movement over performance — walk, stretch, or light Peloton only." });
+    if (rec >= 67) {
+      const extra = heavyDays >= 2 ? " You've trained hard the last 2+ days — push but don't chase PRs." : " Good window for a priority lift or high-effort session.";
+      insights.push({ icon:"💚", text:`Recovery is green (${rec}%).${extra}` });
+    } else if (rec >= 34) {
+      const extra = heavyDays >= 2 ? " Back-to-back training sessions are adding up — moderate effort today is the right call." : " Moderate effort today. Skip max intensity work.";
+      insights.push({ icon:"🟡", text:`Yellow recovery (${rec}%).${extra}` });
+    } else {
+      insights.push({ icon:"🔴", text:`Red recovery (${rec}%). Active recovery only — walk, cold plunge, sauna, or light Peloton. No strength work today.` });
+    }
   }
-  if (!isNaN(hrv) && hrv < 40) insights.push({ icon:"📉", text:`HRV at ${hrv}ms is low. System under stress — watch for fatigue accumulating.` });
-  if (!isNaN(hrv) && hrv >= 70) insights.push({ icon:"📈", text:`HRV at ${hrv}ms is strong. Good window for high-effort training.` });
-  if (!isNaN(debt) && debt > 60) insights.push({ icon:"😴", text:`Sleep debt is ${debt} min. Prioritize 7–8 hours tonight.` });
+
+  // ── Multi-day trend flags ───────────────────────────────────────────────────
+  if (hrvTrend !== null && hrvTrend < -8) {
+    insights.push({ icon:"📉", text:`HRV has dropped ${Math.abs(hrvTrend).toFixed(0)}ms over the last 3 days — cumulative fatigue building. Prioritize sleep and recovery tonight.` });
+  } else if (!isNaN(hrv) && hrv < 40) {
+    insights.push({ icon:"📉", text:`HRV at ${hrv}ms is low. System is under stress — watch for fatigue accumulating this week.` });
+  }
+  if (!isNaN(hrv) && hrv >= 70 && (avgHrv === null || hrv >= avgHrv)) {
+    insights.push({ icon:"📈", text:`HRV at ${hrv}ms — above your 7-day average. Strong autonomic state. Good window for high-effort training.` });
+  }
+
+  // ── Recovery trend flag ─────────────────────────────────────────────────────
+  if (recTrend !== null && recTrend < -15 && avgRec !== null) {
+    insights.push({ icon:"⚠️", text:`Recovery has declined ${Math.abs(recTrend).toFixed(0)} points over 3 days (7-day avg: ${avgRec.toFixed(0)}%). Consider a deload day this week.` });
+  }
+
+  // ── Sleep debt ──────────────────────────────────────────────────────────────
+  if (!isNaN(debt) && debt > 60) {
+    const chronic = avgDebt !== null && avgDebt > 60;
+    insights.push({ icon:"😴", text:`Sleep debt is ${debt} min.${chronic ? " This has been elevated all week — a consistent bedtime this week will compound recovery gains." : " Prioritize 7–8 hours tonight."}` });
+  }
+
+  // ── Weight trend ────────────────────────────────────────────────────────────
   if (!isNaN(wt)) {
-    if (wt > 257) insights.push({ icon:"⚖️", text:`Weight at ${wt} lbs — above target zone. Tighten nutrition today.` });
-    else if (wt < 248) insights.push({ icon:"⚖️", text:`Weight at ${wt} lbs — good downward progress. Keep protein intake high.` });
-    else insights.push({ icon:"⚖️", text:`Weight at ${wt} lbs. Steady in working zone — keep the process consistent.` });
+    const weeklyChange = wtTrend !== null ? wtTrend : null;
+    if (wt > 257) {
+      insights.push({ icon:"⚖️", text:`Weight at ${wt} lbs — above target zone.${weeklyChange !== null ? ` Trending ${weeklyChange > 0 ? "up" : "down"} ${Math.abs(weeklyChange).toFixed(1)} lbs this week.` : ""} Tighten nutrition, especially on the road.` });
+    } else if (avgWt !== null) {
+      const weekDelta = (wt - avgWt).toFixed(1);
+      const direction = weekDelta < 0 ? "down" : "up";
+      insights.push({ icon:"⚖️", text:`Weight at ${wt} lbs (${direction} ${Math.abs(weekDelta)} lbs vs 7-day avg of ${avgWt.toFixed(1)}). ${wt < avgWt ? "Solid downward progress — keep protein high to protect muscle." : "Steady — keep the process consistent."}` });
+    }
   }
-  if (!isNaN(bp) && bp > 135) insights.push({ icon:"❤️", text:`BP is elevated. Reduce sodium today and monitor across the week.` });
+
+  // ── BP flag ─────────────────────────────────────────────────────────────────
+  if (!isNaN(bp) && bp > 135) {
+    insights.push({ icon:"❤️", text:`BP is elevated at ${bp}. Reduce sodium today, prioritize hydration, and monitor trend across the week.` });
+  }
+
+  // ── Training load flag ──────────────────────────────────────────────────────
+  if (heavyDays >= 3 && !isNaN(rec) && rec < 67) {
+    insights.push({ icon:"🏋️", text:`3 consecutive training days with sub-green recovery. A rest or active recovery day today will pay dividends this week.` });
+  }
+
   if (insights.length === 0) return null;
   return (
     <div style={{ background:C.card2, border:`1px solid ${C.border}`, borderRadius:12, padding:"14px 16px" }}>
@@ -319,10 +395,10 @@ function TrendSparkline({ label, unit, color, data, target, targetLabel }) {
 }
 
 // ── SCREEN: DASHBOARD ─────────────────────────────────────────────────────────
-function Dashboard({ workouts, checkins, onStartWorkout }) {
-  const today = checkins.find(c => c.date === todayStr());
+function Dashboard({ workouts, checkins, onStartWorkout }) {  const today = checkins.find(c => c.date === todayStr());
   const rc = recoveryColor(today?.recovery);
-  const currentWeight = today?.weight ? parseFloat(today.weight) : (checkins.length > 0 ? parseFloat(checkins[0].weight) : START_WEIGHT);
+  const mostRecentWeight = checkins.find(c => c.weight && !isNaN(parseFloat(c.weight)));
+  const currentWeight = mostRecentWeight ? parseFloat(mostRecentWeight.weight) : START_WEIGHT;
   const progress = Math.min(100, Math.max(0, ((START_WEIGHT-currentWeight)/(START_WEIGHT-GOAL_WEIGHT))*100));
   const currentDay = getCurrentDay();
   const sessions = Object.values(workouts).sort((a,b) => b.date?.localeCompare(a.date));
@@ -360,7 +436,7 @@ function Dashboard({ workouts, checkins, onStartWorkout }) {
               </div>
             ):null)}
           </div>
-          <CoachInsight entry={today} />
+          <CoachInsight entry={today} checkins={checkins} workouts={workouts} />
         </div>
       ) : (
         <div style={{ background:C.card, border:`2px dashed ${C.border}`, borderRadius:14, padding:"16px", marginBottom:16, textAlign:"center" }}>
@@ -495,7 +571,7 @@ function CheckInScreen({ checkins, onSave }) {
             <textarea value={form.notes} onChange={e=>sf("notes")(e.target.value)} placeholder="Soreness, stress, travel, alcohol, anything notable..." rows={3}
               style={{ background:C.card2, border:`1px solid ${C.border}`, borderRadius:8, color:C.text, padding:"9px 12px", fontSize:13, outline:"none", width:"100%", boxSizing:"border-box", resize:"none", fontFamily:F.body }} />
           </div>
-          {(form.recovery||form.hrv||form.weight) && <CoachInsight entry={form} />}
+          {(form.recovery||form.hrv||form.weight) && <CoachInsight entry={form} checkins={checkins} />}
           <button onClick={handleSave} style={{ background:saved?C.green:C.blue, border:"none", borderRadius:10, color:"#fff", padding:"13px 0", fontSize:14, fontWeight:800, fontFamily:F.display, letterSpacing:"0.08em", cursor:"pointer", transition:"background 0.3s" }}>
             {saved ? "✓ SAVED" : "SAVE CHECK-IN"}
           </button>
@@ -846,7 +922,7 @@ function HistoryScreen({ workouts }) {
 }
 
 // ── SCREEN: PROGRESS ──────────────────────────────────────────────────────────
-function ProgressScreen({ workouts, checkins }) {
+function ProgressScreen({ workouts, checkins, mealLog, hydrationLog, recoveryLog }) {
   const sessions = Object.values(workouts).sort((a,b)=>b.date?.localeCompare(a.date));
   const fourWeeksAgo = new Date(); fourWeeksAgo.setDate(fourWeeksAgo.getDate()-28);
   const volumeByMuscle = {};
@@ -863,6 +939,7 @@ function ProgressScreen({ workouts, checkins }) {
   return (
     <div style={{ padding:"16px", paddingBottom:80 }}>
       <div style={{ fontSize:28, fontWeight:900, color:C.text, fontFamily:F.display, marginBottom:20 }}>PROGRESS</div>
+      <WeeklyReport checkins={checkins} workouts={workouts} mealLog={mealLog||{}} hydrationLog={hydrationLog||{}} recoveryLog={recoveryLog||{}} />
       {checkins.length>=2&&(
         <div style={{marginBottom:20}}>
           <div style={{ fontSize:12, fontWeight:700, color:C.muted, fontFamily:F.display, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:12 }}>Health Trends · Last 7 Days</div>
@@ -896,6 +973,375 @@ function ProgressScreen({ workouts, checkins }) {
   );
 }
 
+// ── RECOVERY ACTIVITIES CONFIG ────────────────────────────────────────────────
+const RECOVERY_ACTIVITIES = [
+  {
+    id: "cold-plunge", name: "Cold Plunge", icon: "🧊", color: "#38bdf8",
+    fields: [
+      { key: "temp", label: "Temp", unit: "°F", type: "number", placeholder: "50" },
+      { key: "duration", label: "Duration", unit: "min", type: "number", placeholder: "3" },
+    ],
+    note: "Optimal: 50–59°F for 3–5 min. Best post-workout or morning."
+  },
+  {
+    id: "sauna", name: "Sauna", icon: "🔥", color: "#f97316",
+    fields: [
+      { key: "temp", label: "Temp", unit: "°F", type: "number", placeholder: "180" },
+      { key: "duration", label: "Duration", unit: "min", type: "number", placeholder: "20" },
+      { key: "rounds", label: "Rounds", unit: "", type: "number", placeholder: "2" },
+    ],
+    note: "Target 15–20 min per round. Hydrate well after."
+  },
+  {
+    id: "yoga", name: "Yoga", icon: "🧘", color: "#a78bfa",
+    fields: [
+      { key: "duration", label: "Duration", unit: "min", type: "number", placeholder: "30" },
+      { key: "style", label: "Style", unit: "", type: "text", placeholder: "Yin / Vinyasa / Restorative" },
+    ],
+    note: "Yin or restorative on red/yellow recovery days."
+  },
+  {
+    id: "stretching", name: "Stretching", icon: "🤸", color: "#34d399",
+    fields: [
+      { key: "duration", label: "Duration", unit: "min", type: "number", placeholder: "15" },
+      { key: "focus", label: "Focus Area", unit: "", type: "text", placeholder: "Hips / Hamstrings / Upper Back" },
+    ],
+    note: "Hold each stretch 45–60s. Focus on training day's muscles."
+  },
+  {
+    id: "meditation", name: "Meditation", icon: "🧠", color: "#818cf8",
+    fields: [
+      { key: "duration", label: "Duration", unit: "min", type: "number", placeholder: "10" },
+      { key: "type", label: "Type", unit: "", type: "text", placeholder: "Breathwork / Body Scan / Visualization" },
+    ],
+    note: "Even 5–10 min lowers cortisol and supports HRV recovery."
+  },
+  {
+    id: "breathwork", name: "Breathwork", icon: "💨", color: "#67e8f9",
+    fields: [
+      { key: "duration", label: "Duration", unit: "min", type: "number", placeholder: "10" },
+      { key: "protocol", label: "Protocol", unit: "", type: "text", placeholder: "Box / 4-7-8 / Wim Hof" },
+    ],
+    note: "Box breathing (4-4-4-4) before bed accelerates recovery."
+  },
+  {
+    id: "massage", name: "Massage / Soft Tissue", icon: "💆", color: "#f472b6",
+    fields: [
+      { key: "duration", label: "Duration", unit: "min", type: "number", placeholder: "30" },
+      { key: "type", label: "Type", unit: "", type: "text", placeholder: "Foam Roll / Gun / Pro Massage" },
+    ],
+    note: "Foam roll tight areas for 60–90s. Focus on quads, lats, calves."
+  },
+  {
+    id: "walk", name: "Light Walk", icon: "🚶", color: "#86efac",
+    fields: [
+      { key: "duration", label: "Duration", unit: "min", type: "number", placeholder: "20" },
+      { key: "distance", label: "Distance", unit: "mi", type: "number", placeholder: "1.0" },
+    ],
+    note: "Zone 1 only. Promotes blood flow without adding training stress."
+  },
+];
+
+// ── Recovery protocol by WHOOP state ─────────────────────────────────────────
+function getRecoveryProtocol(recovery, avgRecovery, recentSessions) {
+  const rec = parseFloat(recovery);
+  const avg = parseFloat(avgRecovery) || rec;
+  const load = recentSessions || 0;
+
+  if (isNaN(rec)) return null;
+
+  if (rec < 34) return {
+    label: "Red Day Protocol", color: C.red,
+    description: "Full recovery focus. No strength training today.",
+    priority: ["cold-plunge", "sauna", "meditation", "stretching"],
+    targets: { "cold-plunge": "3–5 min at 50–55°F", "sauna": "2 rounds × 15 min", "meditation": "10–15 min", "stretching": "20 min full body" }
+  };
+
+  if (rec < 67 || load >= 2) return {
+    label: "Yellow Day Protocol", color: C.amber,
+    description: load >= 2 ? "Training load is accumulating. Prioritize recovery today." : "Moderate recovery. Support your body before pushing hard again.",
+    priority: ["sauna", "stretching", "cold-plunge", "breathwork"],
+    targets: { "sauna": "1–2 rounds × 15 min", "stretching": "15 min", "cold-plunge": "3 min", "breathwork": "10 min box breathing" }
+  };
+
+  return {
+    label: "Green Day Protocol", color: C.green,
+    description: "Recovery looks solid. Light maintenance work today.",
+    priority: ["stretching", "cold-plunge", "meditation", "walk"],
+    targets: { "stretching": "10–15 min post-workout", "cold-plunge": "3–5 min", "meditation": "5–10 min", "walk": "20 min easy" }
+  };
+}
+
+// ── SCREEN: RECOVERY ──────────────────────────────────────────────────────────
+function RecoveryScreen({ recoveryLog, onLogRecovery, checkins, workouts }) {
+  const todayKey = todayStr();
+  const todayLog = recoveryLog[todayKey] || {};
+  const [openActivity, setOpenActivity] = useState(null);
+  const [fields, setFields] = useState({});
+
+  const today = checkins[0]?.date === todayKey ? checkins[0] : null;
+  const last7 = checkins.slice(0, 7);
+  const avgRec = last7.length > 0 ? (last7.map(c => parseFloat(c.recovery)).filter(v => !isNaN(v)).reduce((a,b) => a+b, 0) / last7.length) : null;
+  const recentDates = [0,1,2].map(i => { const d=new Date(); d.setDate(d.getDate()-i); return d.toISOString().split("T")[0]; });
+  const recentSessions = Object.values(workouts).filter(s => recentDates.includes(s.date)).length;
+
+  const protocol = getRecoveryProtocol(today?.recovery, avgRec, recentSessions);
+
+  const toggleDone = async (actId) => {
+    const current = todayLog[actId] || {};
+    const updated = { ...todayLog, [actId]: { ...current, done: !current.done } };
+    await onLogRecovery(todayKey, updated);
+  };
+
+  const saveFields = async (actId) => {
+    const current = todayLog[actId] || {};
+    const updated = { ...todayLog, [actId]: { ...current, ...fields, done: true } };
+    await onLogRecovery(todayKey, updated);
+    setOpenActivity(null);
+    setFields({});
+  };
+
+  const completedCount = Object.values(todayLog).filter(v => v?.done).length;
+
+  return (
+    <div style={{ padding:"16px", paddingBottom:90 }}>
+      <div style={{ fontSize:11, color:C.teal, fontFamily:F.display, letterSpacing:"0.15em", textTransform:"uppercase", marginBottom:2 }}>Recovery</div>
+      <div style={{ fontSize:28, fontWeight:900, color:C.text, fontFamily:F.display, marginBottom:4 }}>TODAY'S PROTOCOL</div>
+      <div style={{ fontSize:13, color:C.muted, fontFamily:F.body, marginBottom:16 }}>{new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric"})}</div>
+
+      {/* Recovery state summary */}
+      {today ? (
+        <div style={{ background: protocol ? protocol.color+"18" : C.card, border:`1px solid ${protocol ? protocol.color+"44" : C.border}`, borderRadius:12, padding:"14px 16px", marginBottom:16 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:8 }}>
+            <div>
+              <div style={{ fontSize:11, color:protocol?.color||C.muted, fontFamily:F.display, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:2 }}>{protocol?.label || "Recovery Protocol"}</div>
+              <div style={{ fontSize:13, color:C.text, fontFamily:F.body, lineHeight:1.5 }}>{protocol?.description}</div>
+            </div>
+            <div style={{ textAlign:"right" }}>
+              <div style={{ fontSize:10, color:C.muted, fontFamily:F.display, letterSpacing:"0.08em", textTransform:"uppercase" }}>Recovery</div>
+              <div style={{ fontSize:32, fontWeight:900, color:protocol?.color||C.text, fontFamily:F.display, lineHeight:1 }}>{today.recovery}%</div>
+            </div>
+          </div>
+          {avgRec && (
+            <div style={{ display:"flex", gap:12, marginTop:8 }}>
+              <div style={{ background:C.card, borderRadius:8, padding:"6px 10px", border:`1px solid ${C.border}` }}>
+                <div style={{ fontSize:9, color:C.muted, fontFamily:F.display, letterSpacing:"0.08em", textTransform:"uppercase" }}>7-Day Avg</div>
+                <div style={{ fontSize:16, fontWeight:800, color:C.text, fontFamily:F.display }}>{avgRec.toFixed(0)}%</div>
+              </div>
+              <div style={{ background:C.card, borderRadius:8, padding:"6px 10px", border:`1px solid ${C.border}` }}>
+                <div style={{ fontSize:9, color:C.muted, fontFamily:F.display, letterSpacing:"0.08em", textTransform:"uppercase" }}>Sessions (3d)</div>
+                <div style={{ fontSize:16, fontWeight:800, color:recentSessions>=3?C.amber:C.text, fontFamily:F.display }}>{recentSessions}</div>
+              </div>
+              <div style={{ background:C.card, borderRadius:8, padding:"6px 10px", border:`1px solid ${C.border}` }}>
+                <div style={{ fontSize:9, color:C.muted, fontFamily:F.display, letterSpacing:"0.08em", textTransform:"uppercase" }}>Done Today</div>
+                <div style={{ fontSize:16, fontWeight:800, color:completedCount>0?C.green:C.text, fontFamily:F.display }}>{completedCount}/{RECOVERY_ACTIVITIES.length}</div>
+              </div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div style={{ background:C.card, border:`2px dashed ${C.border}`, borderRadius:12, padding:"14px 16px", marginBottom:16, textAlign:"center" }}>
+          <div style={{ fontSize:13, color:C.muted, fontFamily:F.body }}>Log your morning check-in to get a personalized recovery protocol.</div>
+        </div>
+      )}
+
+      {/* Priority activities */}
+      {protocol && (
+        <div style={{ marginBottom:12 }}>
+          <div style={{ fontSize:11, color:C.muted, fontFamily:F.display, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:8 }}>Recommended Today</div>
+          <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:16 }}>
+            {protocol.priority.map(id => {
+              const act = RECOVERY_ACTIVITIES.find(a => a.id === id);
+              if (!act) return null;
+              return (
+                <div key={id} style={{ background:act.color+"18", border:`1px solid ${act.color}44`, borderRadius:8, padding:"5px 10px", display:"flex", alignItems:"center", gap:5 }}>
+                  <span style={{ fontSize:13 }}>{act.icon}</span>
+                  <div>
+                    <div style={{ fontSize:11, fontWeight:700, color:act.color, fontFamily:F.display }}>{act.name}</div>
+                    <div style={{ fontSize:9, color:C.muted, fontFamily:F.body }}>{protocol.targets[id]}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* All activities */}
+      <div style={{ fontSize:11, color:C.muted, fontFamily:F.display, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:10 }}>Log Activities</div>
+      {RECOVERY_ACTIVITIES.map(act => {
+        const logged = todayLog[act.id] || {};
+        const isDone = logged.done;
+        const isOpen = openActivity === act.id;
+        const isPriority = protocol?.priority.includes(act.id);
+
+        return (
+          <div key={act.id} style={{ background:C.card, border:`1px solid ${isDone ? act.color+"66" : isPriority ? act.color+"33" : C.border}`, borderRadius:12, marginBottom:8, overflow:"hidden" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"13px 14px" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, flex:1 }}>
+                <span style={{ fontSize:22 }}>{act.icon}</span>
+                <div>
+                  <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                    <span style={{ fontSize:15, fontWeight:700, color:isDone?act.color:C.text, fontFamily:F.display }}>{act.name}</span>
+                    {isPriority && !isDone && <span style={{ fontSize:9, color:act.color, fontFamily:F.display, letterSpacing:"0.08em", background:act.color+"22", borderRadius:4, padding:"1px 5px" }}>TODAY</span>}
+                  </div>
+                  {isDone && Object.entries(logged).filter(([k]) => k !== "done").length > 0 && (
+                    <div style={{ fontSize:11, color:C.muted, fontFamily:F.body, marginTop:2 }}>
+                      {Object.entries(logged).filter(([k]) => k !== "done").map(([k,v]) => {
+                        const f = act.fields.find(f => f.key === k);
+                        return f ? `${f.label}: ${v}${f.unit}` : null;
+                      }).filter(Boolean).join(" · ")}
+                    </div>
+                  )}
+                  {!isDone && <div style={{ fontSize:11, color:C.muted, fontFamily:F.body, marginTop:1 }}>{act.note}</div>}
+                </div>
+              </div>
+              <div style={{ display:"flex", gap:6 }}>
+                {!isDone && (
+                  <button onClick={() => { setOpenActivity(isOpen ? null : act.id); setFields({}); }}
+                    style={{ background:C.dim, border:`1px solid ${C.border}`, borderRadius:8, color:C.muted, padding:"6px 10px", fontSize:10, fontFamily:F.display, cursor:"pointer", letterSpacing:"0.06em" }}>
+                    {isOpen ? "CANCEL" : "LOG"}
+                  </button>
+                )}
+                <button onClick={() => toggleDone(act.id)}
+                  style={{ background:isDone?act.color+"22":C.dim, border:`1px solid ${isDone?act.color:C.border}`, borderRadius:8, color:isDone?act.color:C.muted, padding:"6px 10px", fontSize:13, cursor:"pointer", minWidth:36, textAlign:"center" }}>
+                  {isDone ? "✓" : "○"}
+                </button>
+              </div>
+            </div>
+
+            {isOpen && !isDone && (
+              <div style={{ borderTop:`1px solid ${C.dim}`, padding:"12px 14px", background:C.card2 }}>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:10 }}>
+                  {act.fields.map(f => (
+                    <div key={f.key}>
+                      <div style={{ fontSize:10, color:C.muted, fontFamily:F.display, letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:3 }}>
+                        {f.label}{f.unit ? ` (${f.unit})` : ""}
+                      </div>
+                      <input type={f.type} placeholder={f.placeholder} value={fields[f.key]||""}
+                        onChange={e => setFields(prev => ({...prev, [f.key]: e.target.value}))}
+                        style={{ background:C.bg, border:`1px solid ${C.border}`, borderRadius:6, color:C.text, padding:"7px 10px", fontSize:14, fontWeight:700, fontFamily:F.display, width:"100%", boxSizing:"border-box", outline:"none" }} />
+                    </div>
+                  ))}
+                </div>
+                <button onClick={() => saveFields(act.id)}
+                  style={{ width:"100%", background:act.color, border:"none", borderRadius:8, color:"#fff", padding:"10px", fontSize:12, fontWeight:800, fontFamily:F.display, letterSpacing:"0.08em", cursor:"pointer" }}>
+                  MARK COMPLETE
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── WEEKLY REPORT ─────────────────────────────────────────────────────────────
+function WeeklyReport({ checkins, workouts, mealLog, hydrationLog, recoveryLog }) {
+  const [copied, setCopied] = useState(false);
+
+  const generateReport = () => {
+    const last7dates = Array.from({length:7}, (_,i) => {
+      const d = new Date(); d.setDate(d.getDate()-i);
+      return d.toISOString().split("T")[0];
+    });
+
+    const weekCheckins = checkins.filter(c => last7dates.includes(c.date));
+    const weekWorkouts = Object.values(workouts).filter(s => last7dates.includes(s.date));
+
+    const avg = (key) => {
+      const vals = weekCheckins.map(c => parseFloat(c[key])).filter(v => !isNaN(v));
+      return vals.length > 0 ? (vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1) : "N/A";
+    };
+
+    const startWt = weekCheckins.length > 0 ? parseFloat(weekCheckins[weekCheckins.length-1].weight) : null;
+    const endWt   = weekCheckins.length > 0 ? parseFloat(weekCheckins[0].weight) : null;
+    const wtDelta = startWt && endWt ? (endWt - startWt).toFixed(1) : null;
+
+    const totalHydration = last7dates.reduce((a, d) => a + (hydrationLog[d] || 0), 0);
+    const avgHydration = (totalHydration / 7).toFixed(0);
+
+    const recoveryDays = last7dates.reduce((a, d) => {
+      const log = recoveryLog[d] || {};
+      return a + Object.values(log).filter(v => v?.done).length;
+    }, 0);
+
+    const workoutSummary = weekWorkouts.map(s => {
+      const plan = PLANS.find(p => p.id === s.planId);
+      const sets = Object.values(s.sets||{}).reduce((a,ex) => a + Object.values(ex).filter(x=>x.done).length, 0);
+      return `  • ${fmtDate(s.date)}: ${plan?.label||"Workout"} — ${sets} sets${s.note ? ` (${s.note})` : ""}`;
+    }).join("\n");
+
+    const notes = weekCheckins.filter(c => c.notes).map(c => `  • ${fmtDate(c.date)}: ${c.notes}`).join("\n");
+
+    const report = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WEEKLY CHECK-IN — ${new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RECOVERY & HRV
+• Avg Recovery Score: ${avg("recovery")}%
+• Avg HRV: ${avg("hrv")}ms
+• Avg Resting HR: ${avg("rhr")}bpm
+• Avg Sleep Performance: ${avg("sleepPerf")}%
+• Avg Time Asleep: ${avg("timeAsleep")}hrs
+• Avg Sleep Debt: ${avg("sleepDebt")}min
+
+BODY METRICS
+• Weight (start of week): ${startWt || "N/A"} lbs
+• Weight (end of week): ${endWt || "N/A"} lbs
+• Weight change: ${wtDelta ? (parseFloat(wtDelta) > 0 ? "+" : "") + wtDelta + " lbs" : "N/A"}
+• Avg BP: ${avg("bpSys")}/${avg("bpDia")} mmHg
+
+TRAINING — ${weekWorkouts.length} sessions
+${workoutSummary || "  No sessions logged"}
+
+NUTRITION & HYDRATION
+• Avg Hydration: ${avgHydration} oz/day (target: 100 oz)
+
+RECOVERY ACTIVITIES
+• Total activities logged this week: ${recoveryDays}
+
+NOTES
+${notes || "  None"}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Please review and provide:
+1. Training plan adjustments for next week
+2. Target weight updates if needed
+3. Any recovery or nutrition flags
+4. Focus areas based on trends above
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+
+    return report;
+  };
+
+  const handleCopy = () => {
+    const report = generateReport();
+    navigator.clipboard.writeText(report).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 3000);
+    });
+  };
+
+  return (
+    <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:12, padding:"16px", marginBottom:16 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
+        <div>
+          <div style={{ fontSize:11, color:C.blue, fontFamily:F.display, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:2 }}>Weekly Coaching</div>
+          <div style={{ fontSize:16, fontWeight:800, color:C.text, fontFamily:F.display }}>Generate Report</div>
+          <div style={{ fontSize:12, color:C.muted, fontFamily:F.body, marginTop:3 }}>Copy and paste into your Claude chat for weekly coaching review</div>
+        </div>
+        <span style={{ fontSize:24 }}>📋</span>
+      </div>
+      <button onClick={handleCopy}
+        style={{ width:"100%", background:copied?C.green:C.blue, border:"none", borderRadius:10, color:"#fff", padding:"12px 0", fontSize:13, fontWeight:800, fontFamily:F.display, letterSpacing:"0.08em", cursor:"pointer", transition:"background 0.3s" }}>
+        {copied ? "✓ COPIED — PASTE INTO CLAUDE" : "COPY WEEKLY REPORT"}
+      </button>
+    </div>
+  );
+}
+
 // ── BOTTOM NAV ────────────────────────────────────────────────────────────────
 function BottomNav({ tab, setTab, hasCheckinToday }) {
   const tabs = [
@@ -903,6 +1349,7 @@ function BottomNav({ tab, setTab, hasCheckinToday }) {
     { id:"checkin",   label:"Check-In", icon:"📊", badge:!hasCheckinToday },
     { id:"workout",   label:"Workout",  icon:"⚡" },
     { id:"meals",     label:"Nutrition",icon:"🥗" },
+    { id:"recovery",  label:"Recovery", icon:"🧊" },
     { id:"progress",  label:"Progress", icon:"📈" },
   ];
   return (
@@ -926,6 +1373,7 @@ export default function App() {
   const [mealLog, setMealLog] = useState({});
   const [checkins, setCheckins] = useState([]);
   const [hydrationLog, setHydrationLog] = useState({});
+  const [recoveryLog, setRecoveryLog] = useState({});
   const [launchPlanId, setLaunchPlanId] = useState(null);
   const [syncing, setSyncing] = useState(true);
   const [syncError, setSyncError] = useState(false);
@@ -934,8 +1382,8 @@ export default function App() {
     const load = async () => {
       setSyncing(true);
       try {
-        const [w, m, c, h] = await Promise.all([DB.loadWorkouts(), DB.loadMeals(), DB.loadCheckins(), DB.loadHydration()]);
-        setWorkouts(w); setMealLog(m); setCheckins(c); setHydrationLog(h);
+        const [w, m, c, h, r] = await Promise.all([DB.loadWorkouts(), DB.loadMeals(), DB.loadCheckins(), DB.loadHydration(), DB.loadRecovery()]);
+        setWorkouts(w); setMealLog(m); setCheckins(c); setHydrationLog(h); setRecoveryLog(r);
         setSyncError(false);
       } catch { setSyncError(true); }
       finally { setSyncing(false); }
@@ -947,6 +1395,7 @@ export default function App() {
   const saveMeal = async (day, meal, data) => { const dd={...(mealLog[day]||{}),[meal]:data}; const u={...mealLog,[day]:dd}; setMealLog(u); await DB.saveMeals(day,dd); };
   const saveCheckin = async (entry) => { const u=[entry,...checkins.filter(c=>c.date!==entry.date)].sort((a,b)=>b.date.localeCompare(a.date)); setCheckins(u); await DB.saveCheckin(entry); };
   const saveHydration = async (dateKey, oz) => { const u={...hydrationLog,[dateKey]:oz}; setHydrationLog(u); await DB.saveHydration(dateKey,oz); };
+  const saveRecovery = async (dateKey, data) => { const u={...recoveryLog,[dateKey]:data}; setRecoveryLog(u); await DB.saveRecovery(dateKey,data); };
 
   const hasCheckinToday = checkins.some(c=>c.date===todayStr());
   const handleStartWorkout = (planId) => { setLaunchPlanId(planId); setTab("workout"); };
@@ -964,7 +1413,8 @@ export default function App() {
         {tab==="checkin"   && <CheckInScreen checkins={checkins} onSave={saveCheckin} />}
         {tab==="workout"   && <WorkoutScreen workouts={workouts} onSave={saveWorkout} initPlanId={launchPlanId} />}
         {tab==="meals"     && <MealPlanScreen mealLog={mealLog} onLogMeal={saveMeal} hydrationLog={hydrationLog} onLogHydration={saveHydration} />}
-        {tab==="progress"  && <ProgressScreen workouts={workouts} checkins={checkins} />}
+        {tab==="recovery"  && <RecoveryScreen recoveryLog={recoveryLog} onLogRecovery={saveRecovery} checkins={checkins} workouts={workouts} />}
+        {tab==="progress"  && <ProgressScreen workouts={workouts} checkins={checkins} mealLog={mealLog} hydrationLog={hydrationLog} recoveryLog={recoveryLog} />}
       </div>
       <BottomNav tab={tab} setTab={setTab} hasCheckinToday={hasCheckinToday} />
     </div>
